@@ -1,6 +1,6 @@
 # Automation-Commands-Plink.ps1
 # Single-file GUI runner focused on plink.
-# - Writes commands with LF only (no CR)
+# - Runs commands via clish -c (single SSH connection per host)
 # - Allows adding commands via textbox
 # - Uses plink via argument array and captures output
 # - Writes per-host logs to .\logs\<host>.log
@@ -167,7 +167,6 @@ $btnRun.Add_Click({
     $btnAddCmd.Enabled = $false
 
     $password = $txtPw.Text
-    $lf = [char]10   # LF only
 
     $txtOutput.AppendText("Starting run at $([DateTime]::Now)`r`n")
     $txtOutput.AppendText("Hosts: $($selectedHosts -join ', ')`r`n")
@@ -179,19 +178,20 @@ $btnRun.Add_Click({
         $txtOutput.AppendText("-> $targetHost ...`r`n")
         $logfile = Join-Path $LogFolder ("$targetHost.log")
 
-        # compose LF-only content
-        $content = ($selectedCmds -join $lf) + $lf
-
-        # create temp file and write ASCII LF-only
-        $tmpFile = [System.IO.Path]::GetTempFileName()
         try {
-            [System.IO.File]::WriteAllText($tmpFile, $content, [System.Text.Encoding]::ASCII)
+            # build clish -c "cmd1" -c "cmd2" ... as a single remote command
+            $clishArgs = ($selectedCmds | ForEach-Object {
+                $escaped = $_ -replace '"','\"'
+                "-c `"$escaped`""
+            }) -join ' '
+            $remoteCommand = "clish $clishArgs"
 
             # build plink args
             $plinkArgs = @()
-            $plinkArgs += "$User@$targetHost"
+            $plinkArgs += '-batch'
             if ($password -ne '') { $plinkArgs += '-pw'; $plinkArgs += $password }
-            $plinkArgs += '-batch'; $plinkArgs += '-m'; $plinkArgs += $tmpFile
+            $plinkArgs += "$User@$targetHost"
+            $plinkArgs += $remoteCommand
 
             # invoke plink and capture all output (stdout+stderr)
             $txtOutput.AppendText("Executing: $PlinkPath $($plinkArgs -join ' ')`r`n")
@@ -208,9 +208,6 @@ $btnRun.Add_Click({
             $txtOutput.AppendText("  done (log: $logfile)`r`n`r`n")
         } catch {
             $txtOutput.AppendText("  ERROR: $_`r`n")
-        } finally {
-            # ensure temp file removed
-            if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
         }
 
         Start-Sleep -Milliseconds 200
