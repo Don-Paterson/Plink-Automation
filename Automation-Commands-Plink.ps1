@@ -1,7 +1,8 @@
 # Automation-Commands-Plink.ps1
 # GUI runner using plink stdin piping for Check Point clish.
 # - Uses System.Diagnostics.Process for reliable stdin/stdout in BackgroundWorker
-# - Commands piped via stdin (newline-separated) — no 'clish' prefix needed
+# - Auto-detects login shell: tries plain commands first (clish shell),
+#   retries with 'clish -c' wrapping if CLINFR0329 is returned (bash/expert shell)
 # - PSScriptRoot fallback for irm | iex usage ($PWD used when no file on disk)
 # - Per-host logs written to <script-or-cwd>\logs\<host>.log
 # - Host key accepted via leading 'y' in stdin (PuTTY 0.72 compatible)
@@ -208,19 +209,19 @@ function Set-UIEnabled {
     }
 }
 
-# Invoke plink using System.Diagnostics.Process so we have full control over
-# stdin/stdout — the PowerShell pipe operator blocks in BackgroundWorker threads.
+# Invoke plink using System.Diagnostics.Process — the PowerShell pipe operator
+# blocks when called from a BackgroundWorker thread, so we manage stdin/stdout directly.
 function Invoke-Plink {
     param(
         [string]$PlinkExe,
-        [string[]]$Args,
+        [string[]]$PlinkArgs,
         [string]$StdinText,
         [int]$TimeoutMs = 30000
     )
 
     $psi                        = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName               = $PlinkExe
-    $psi.Arguments              = $Args -join ' '
+    $psi.Arguments              = $PlinkArgs -join ' '
     $psi.UseShellExecute        = $false
     $psi.RedirectStandardInput  = $true
     $psi.RedirectStandardOutput = $true
@@ -229,11 +230,9 @@ function Invoke-Plink {
 
     $proc = [System.Diagnostics.Process]::Start($psi)
 
-    # Write stdin then close so plink knows input is done
     $proc.StandardInput.WriteLine($StdinText)
     $proc.StandardInput.Close()
 
-    # Read stdout and stderr
     $stdout = $proc.StandardOutput.ReadToEnd()
     $stderr = $proc.StandardError.ReadToEnd()
 
@@ -299,7 +298,8 @@ $worker.Add_DoWork({
     $plink    = $a.PlinkPath
     $user     = $a.User
 
-    # UI append defined inline — no external function dependency across thread boundary
+    # UI append defined inline — functions defined outside DoWork are not
+    # accessible across the BackgroundWorker thread boundary in PowerShell.
     $uiAppend = [Action[string]]{
         param($t)
         $out.AppendText($t)
@@ -314,9 +314,15 @@ $worker.Add_DoWork({
     foreach ($c in $cmds) { & $log "  $c`r`n" }
     & $log "`r`n"
 
-    # 'y' answers the host-key prompt on first connection (PuTTY 0.72).
-    # Subsequent connections ignore it — clish just returns CLINFR0329 and moves on.
-    $stdinPayload = "y`n" + ($cmds -join "`n")
+    # First attempt: plain commands via stdin, one per line.
+    # This works when the SSH login shell is clish (standard Gaia).
+    # 'y' at the front answers the host-key prompt on first connection (PuTTY 0.72).
+    $clishPayload = "y`n" + ($cmds -join "`n")
+
+    # Fallback: single clish -c "cmd1" -c "cmd2" ... string via stdin.
+    # Used when the login shell is bash/expert mode — clish must be invoked explicitly.
+    $clishWrapped  = ($cmds | ForEach-Object { "-c `"$($_ -replace '"', '\"')`"" }) -join ' '
+    $expertPayload = "y`nclish $clishWrapped"
 
     foreach ($targetHost in $hosts) {
         & $log "-> $targetHost`r`n"
@@ -325,7 +331,7 @@ $worker.Add_DoWork({
         try {
             $plinkArgs = @('-batch')
             if ($password -ne '') {
-                $plinkArgs += "-pw"
+                $plinkArgs += '-pw'
                 $plinkArgs += $password
             }
             $plinkArgs += "$user@$targetHost"
@@ -334,16 +340,25 @@ $worker.Add_DoWork({
             & $log "  cmd   : $plink $displayArgs`r`n"
             & $log "  stdin : $($cmds -join ' | ')`r`n"
 
-            $$result  = Invoke-Plink -PlinkExe $plink -Args $plinkArgs -StdinText $stdinPayload
+            # First attempt — clish login shell
+            $result  = Invoke-Plink -PlinkExe $plink -PlinkArgs $plinkArgs -StdinText $clishPayload
             $outText = $result.Output
 
-            # If clish rejected the commands, the shell is bash/expert — retry with clish -c wrapping
+            # If CLINFR0329 appears the shell is bash — retry with clish -c wrapping
             if ($outText -match 'CLINFR0329') {
-                & $log "  [clish not default shell — retrying via clish -c]`r`n"
-                $clishWrapped = ($cmds | ForEach-Object { "-c `"$($_ -replace '"','\"')`"" }) -join ' '
-                $expertPayload = "clish $clishWrapped"
-                $result  = Invoke-Plink -PlinkExe $plink -Args $plinkArgs -StdinText $expertPayload
+                & $log "  [login shell is bash — retrying with clish -c]`r`n"
+                $result  = Invoke-Plink -PlinkExe $plink -PlinkArgs $plinkArgs -StdinText $expertPayload
                 $outText = $result.Output
+            }
+
+            $exitCode = $result.ExitCode
+
+            if ($outText -ne '') {
+                $outText | Out-File -FilePath $logfile -Encoding UTF8
+                & $log "$outText`r`n"
+            } else {
+                & $log "  [no output]`r`n"
+                '' | Out-File -FilePath $logfile -Encoding UTF8
             }
 
             $status = if ($exitCode -eq 0) { 'OK' } else { "EXIT $exitCode" }
