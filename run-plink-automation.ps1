@@ -280,7 +280,7 @@ $worker.Add_DoWork({
         $logfile = Join-Path $LogFolder ("$targetHost.log")
 
         try {
-            $plinkArgs = @('-batch', '-auto-store-sshkey')
+            $plinkArgs = @('-batch')
             if ($password -ne '') {
                 $plinkArgs += '-pw'
                 $plinkArgs += $password
