@@ -334,16 +334,16 @@ $worker.Add_DoWork({
             & $log "  cmd   : $plink $displayArgs`r`n"
             & $log "  stdin : $($cmds -join ' | ')`r`n"
 
-            $result   = Invoke-Plink -PlinkExe $plink -Args $plinkArgs -StdinText $stdinPayload
-            $outText  = $result.Output
-            $exitCode = $result.ExitCode
+            $$result  = Invoke-Plink -PlinkExe $plink -Args $plinkArgs -StdinText $stdinPayload
+            $outText = $result.Output
 
-            if ($outText -ne '') {
-                $outText | Out-File -FilePath $logfile -Encoding UTF8
-                & $log "$outText`r`n"
-            } else {
-                & $log "  [no output]`r`n"
-                '' | Out-File -FilePath $logfile -Encoding UTF8
+            # If clish rejected the commands, the shell is bash/expert — retry with clish -c wrapping
+            if ($outText -match 'CLINFR0329') {
+                & $log "  [clish not default shell — retrying via clish -c]`r`n"
+                $clishWrapped = ($cmds | ForEach-Object { "-c `"$($_ -replace '"','\"')`"" }) -join ' '
+                $expertPayload = "clish $clishWrapped"
+                $result  = Invoke-Plink -PlinkExe $plink -Args $plinkArgs -StdinText $expertPayload
+                $outText = $result.Output
             }
 
             $status = if ($exitCode -eq 0) { 'OK' } else { "EXIT $exitCode" }
