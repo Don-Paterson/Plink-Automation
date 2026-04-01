@@ -293,7 +293,7 @@ $worker.Add_DoWork({
             Append "  stdin> $($cmds -join ' | ')`r`n"
 
             # Pipe commands via stdin
-            $procOutput = $stdinPayload | & $PlinkPath @plinkArgs 2>&1
+            $procOutput = "y`n$stdinPayload" | & $PlinkPath @plinkArgs 2>&1
             $exitCode   = $LASTEXITCODE
 
             if ($procOutput) {
