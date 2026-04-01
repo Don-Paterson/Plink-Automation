@@ -334,13 +334,73 @@ $worker.Add_DoWork({
     Append $out "Finished at $([DateTime]::Now)`r`n"
 })
 
-$worker.Add_RunWorkerCompleted({
-    Set-UIEnabled $true
-    [System.Windows.Forms.MessageBox]::Show(
-        "Run complete.`nLogs in: $LogFolder",
-        'Done',
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+$worker.Add_DoWork({
+    param($sender, $e)
+    $a        = $e.Argument
+    $hosts    = $a.Hosts
+    $cmds     = $a.Commands
+    $password = $a.Password
+    $out      = $a.Output
+    $logDir   = $a.LogFolder
+    $plink    = $a.PlinkPath
+    $user     = $a.User
+
+    $append = [Action[string]]{
+        param($t)
+        $out.AppendText($t)
+        $out.SelectionStart = $out.Text.Length
+        $out.ScrollToCaret()
+    }
+
+    $ui = [scriptblock]{
+        param($t)
+        $out.Invoke($append, $t)
+    }
+
+    & $ui "Starting run at $([DateTime]::Now)`r`n"
+    & $ui "Hosts   : $($hosts -join ', ')`r`n"
+    & $ui "Commands:`r`n"
+    foreach ($c in $cmds) { & $ui "  $c`r`n" }
+    & $ui "`r`n"
+
+    $stdinPayload = "y`n" + ($cmds -join "`n")
+
+    foreach ($targetHost in $hosts) {
+        & $ui "-> $targetHost`r`n"
+        $logfile = Join-Path $logDir "$targetHost.log"
+
+        try {
+            $plinkArgs = @('-batch')
+            if ($password -ne '') { $plinkArgs += '-pw'; $plinkArgs += $password }
+            $plinkArgs += "$user@$targetHost"
+
+            $displayArgs = $plinkArgs -replace [regex]::Escape($password), '********'
+            & $ui "  cmd   : $plink $($displayArgs -join ' ')`r`n"
+            & $ui "  stdin : $($cmds -join ' | ')`r`n"
+
+            $procOutput = $stdinPayload | & $plink @plinkArgs 2>&1
+            $exitCode   = $LASTEXITCODE
+
+            if ($procOutput) {
+                $outText = ($procOutput | ForEach-Object { $_.ToString() }) -join "`r`n"
+                $outText | Out-File -FilePath $logfile -Encoding UTF8
+                & $ui "$outText`r`n"
+            } else {
+                & $ui "  [no output]`r`n"
+                '' | Out-File -FilePath $logfile -Encoding UTF8
+            }
+
+            $status = if ($exitCode -eq 0) { 'OK' } else { "EXIT $exitCode" }
+            & $ui "  status: $status  |  log: $logfile`r`n`r`n"
+
+        } catch {
+            & $ui "  ERROR: $_`r`n`r`n"
+        }
+
+        Start-Sleep -Milliseconds 300
+    }
+
+    & $ui "Finished at $([DateTime]::Now)`r`n"
 })
 
 #endregion
