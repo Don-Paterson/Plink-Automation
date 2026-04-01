@@ -1,9 +1,9 @@
 # Automation-Commands-Plink.ps1
 # GUI runner using plink stdin piping for Check Point clish.
+# - Uses System.Diagnostics.Process for reliable stdin/stdout in BackgroundWorker
 # - Commands piped via stdin (newline-separated) — no 'clish' prefix needed
 # - PSScriptRoot fallback for irm | iex usage ($PWD used when no file on disk)
 # - Per-host logs written to <script-or-cwd>\logs\<host>.log
-# - Runs on a BackgroundWorker so the UI stays responsive
 # - Host key accepted via leading 'y' in stdin (PuTTY 0.72 compatible)
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -194,27 +194,6 @@ function Get-CheckedStrings([System.Windows.Forms.CheckedListBox]$clb) {
     return $arr
 }
 
-# Thread-safe append + auto-scroll.
-# $output passed explicitly — closures across BackgroundWorker boundaries
-# cannot reliably capture parent-scope variables in PowerShell.
-function Append {
-    param(
-        [System.Windows.Forms.TextBox]$output,
-        [string]$text
-    )
-    $sb = [scriptblock]{
-        param($t)
-        $output.AppendText($t)
-        $output.SelectionStart = $output.Text.Length
-        $output.ScrollToCaret()
-    }
-    if ($output.InvokeRequired) {
-        $output.Invoke($sb, $text)
-    } else {
-        & $sb $text
-    }
-}
-
 function Set-UIEnabled {
     param([bool]$enabled)
     $controls = @($btnRun, $btnCancel, $txtPw, $txtNewCmd, $btnAddCmd,
@@ -226,6 +205,45 @@ function Set-UIEnabled {
         } else {
             $ctrl.Enabled = $enabled
         }
+    }
+}
+
+# Invoke plink using System.Diagnostics.Process so we have full control over
+# stdin/stdout — the PowerShell pipe operator blocks in BackgroundWorker threads.
+function Invoke-Plink {
+    param(
+        [string]$PlinkExe,
+        [string[]]$Args,
+        [string]$StdinText,
+        [int]$TimeoutMs = 30000
+    )
+
+    $psi                        = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $PlinkExe
+    $psi.Arguments              = $Args -join ' '
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardInput  = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+
+    # Write stdin then close so plink knows input is done
+    $proc.StandardInput.WriteLine($StdinText)
+    $proc.StandardInput.Close()
+
+    # Read stdout and stderr
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+
+    $proc.WaitForExit($TimeoutMs) | Out-Null
+    $exitCode = $proc.ExitCode
+    $proc.Dispose()
+
+    return [PSCustomObject]@{
+        Output   = ($stdout + $stderr).Trim()
+        ExitCode = $exitCode
     }
 }
 
@@ -259,7 +277,6 @@ $btnRun.Add_Click({
 
     Set-UIEnabled $false
 
-    # Pass everything the worker needs explicitly — avoids closure capture issues
     $worker.RunWorkerAsync([PSCustomObject]@{
         Hosts     = $selectedHosts
         Commands  = $selectedCmds
@@ -282,125 +299,73 @@ $worker.Add_DoWork({
     $plink    = $a.PlinkPath
     $user     = $a.User
 
-    Append $out "Starting run at $([DateTime]::Now)`r`n"
-    Append $out "Hosts   : $($hosts -join ', ')`r`n"
-    Append $out "Commands:`r`n"
-    foreach ($c in $cmds) { Append $out "  $c`r`n" }
-    Append $out "`r`n"
-
-    # 'y' prepended to accept host key on first connection (PuTTY 0.72 compatible).
-    # Commands are newline-separated and fed to clish via stdin —
-    # no 'clish' prefix needed as it is already the SSH login shell on Gaia.
-    $stdinPayload = "y`n" + ($cmds -join "`n")
-
-    foreach ($targetHost in $hosts) {
-        Append $out "-> $targetHost`r`n"
-        $logfile = Join-Path $logDir "$targetHost.log"
-
-        try {
-            $plinkArgs = @('-batch')
-            if ($password -ne '') {
-                $plinkArgs += '-pw'
-                $plinkArgs += $password
-            }
-            $plinkArgs += "$user@$targetHost"
-
-            $displayArgs = $plinkArgs -replace [regex]::Escape($password), '********'
-            Append $out "  cmd   : $plink $($displayArgs -join ' ')`r`n"
-            Append $out "  stdin : $($cmds -join ' | ')`r`n"
-
-            $procOutput = $stdinPayload | & $plink @plinkArgs 2>&1
-            $exitCode   = $LASTEXITCODE
-
-            if ($procOutput) {
-                $outText = ($procOutput | ForEach-Object { $_.ToString() }) -join "`r`n"
-                $outText | Out-File -FilePath $logfile -Encoding UTF8
-                Append $out "$outText`r`n"
-            } else {
-                Append $out "  [no output]`r`n"
-                '' | Out-File -FilePath $logfile -Encoding UTF8
-            }
-
-            $status = if ($exitCode -eq 0) { 'OK' } else { "EXIT $exitCode" }
-            Append $out "  status: $status  |  log: $logfile`r`n`r`n"
-
-        } catch {
-            Append $out "  ERROR: $_`r`n`r`n"
-        }
-
-        Start-Sleep -Milliseconds 300
-    }
-
-    Append $out "Finished at $([DateTime]::Now)`r`n"
-})
-
-$worker.Add_DoWork({
-    param($sender, $e)
-    $a        = $e.Argument
-    $hosts    = $a.Hosts
-    $cmds     = $a.Commands
-    $password = $a.Password
-    $out      = $a.Output
-    $logDir   = $a.LogFolder
-    $plink    = $a.PlinkPath
-    $user     = $a.User
-
-    $append = [Action[string]]{
+    # UI append defined inline — no external function dependency across thread boundary
+    $uiAppend = [Action[string]]{
         param($t)
         $out.AppendText($t)
         $out.SelectionStart = $out.Text.Length
         $out.ScrollToCaret()
     }
+    $log = { param($t); $out.Invoke($uiAppend, $t) }
 
-    $ui = [scriptblock]{
-        param($t)
-        $out.Invoke($append, $t)
-    }
+    & $log "Starting run at $([DateTime]::Now)`r`n"
+    & $log "Hosts   : $($hosts -join ', ')`r`n"
+    & $log "Commands:`r`n"
+    foreach ($c in $cmds) { & $log "  $c`r`n" }
+    & $log "`r`n"
 
-    & $ui "Starting run at $([DateTime]::Now)`r`n"
-    & $ui "Hosts   : $($hosts -join ', ')`r`n"
-    & $ui "Commands:`r`n"
-    foreach ($c in $cmds) { & $ui "  $c`r`n" }
-    & $ui "`r`n"
-
+    # 'y' answers the host-key prompt on first connection (PuTTY 0.72).
+    # Subsequent connections ignore it — clish just returns CLINFR0329 and moves on.
     $stdinPayload = "y`n" + ($cmds -join "`n")
 
     foreach ($targetHost in $hosts) {
-        & $ui "-> $targetHost`r`n"
+        & $log "-> $targetHost`r`n"
         $logfile = Join-Path $logDir "$targetHost.log"
 
         try {
             $plinkArgs = @('-batch')
-            if ($password -ne '') { $plinkArgs += '-pw'; $plinkArgs += $password }
+            if ($password -ne '') {
+                $plinkArgs += "-pw"
+                $plinkArgs += $password
+            }
             $plinkArgs += "$user@$targetHost"
 
-            $displayArgs = $plinkArgs -replace [regex]::Escape($password), '********'
-            & $ui "  cmd   : $plink $($displayArgs -join ' ')`r`n"
-            & $ui "  stdin : $($cmds -join ' | ')`r`n"
+            $displayArgs = ($plinkArgs -join ' ') -replace [regex]::Escape($password), '********'
+            & $log "  cmd   : $plink $displayArgs`r`n"
+            & $log "  stdin : $($cmds -join ' | ')`r`n"
 
-            $procOutput = $stdinPayload | & $plink @plinkArgs 2>&1
-            $exitCode   = $LASTEXITCODE
+            $result   = Invoke-Plink -PlinkExe $plink -Args $plinkArgs -StdinText $stdinPayload
+            $outText  = $result.Output
+            $exitCode = $result.ExitCode
 
-            if ($procOutput) {
-                $outText = ($procOutput | ForEach-Object { $_.ToString() }) -join "`r`n"
+            if ($outText -ne '') {
                 $outText | Out-File -FilePath $logfile -Encoding UTF8
-                & $ui "$outText`r`n"
+                & $log "$outText`r`n"
             } else {
-                & $ui "  [no output]`r`n"
+                & $log "  [no output]`r`n"
                 '' | Out-File -FilePath $logfile -Encoding UTF8
             }
 
             $status = if ($exitCode -eq 0) { 'OK' } else { "EXIT $exitCode" }
-            & $ui "  status: $status  |  log: $logfile`r`n`r`n"
+            & $log "  status: $status  |  log: $logfile`r`n`r`n"
 
         } catch {
-            & $ui "  ERROR: $_`r`n`r`n"
+            & $log "  ERROR: $_`r`n`r`n"
         }
 
         Start-Sleep -Milliseconds 300
     }
 
-    & $ui "Finished at $([DateTime]::Now)`r`n"
+    & $log "Finished at $([DateTime]::Now)`r`n"
+})
+
+$worker.Add_RunWorkerCompleted({
+    Set-UIEnabled $true
+    [System.Windows.Forms.MessageBox]::Show(
+        "Run complete.`nLogs in: $LogFolder",
+        'Done',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
 })
 
 #endregion
