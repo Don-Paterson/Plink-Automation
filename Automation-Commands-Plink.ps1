@@ -1,9 +1,9 @@
 # Automation-Commands-Plink.ps1
-# GUI runner using plink stdin piping for Check Point clish.
-# - Uses System.Diagnostics.Process for reliable stdin/stdout in BackgroundWorker
+# GUI runner for Check Point clish commands via plink.
+# - Synchronous execution on UI thread — no BackgroundWorker complexity
 # - Auto-detects login shell: tries plain commands first (clish shell),
-#   retries with 'clish -c' wrapping if CLINFR0329 is returned (bash/expert shell)
-# - PSScriptRoot fallback for irm | iex usage ($PWD used when no file on disk)
+#   retries with 'clish -c' wrapping if CLINFR0329 returned (bash/expert shell)
+# - PSScriptRoot fallback for irm | iex ($PWD used when no file on disk)
 # - Per-host logs written to <script-or-cwd>\logs\<host>.log
 # - Host key accepted via leading 'y' in stdin (PuTTY 0.72 compatible)
 
@@ -166,12 +166,12 @@ $btnRun.Location = New-Object System.Drawing.Point(390, 375)
 $btnRun.Size     = New-Object System.Drawing.Size(100, 36)
 $form.Controls.Add($btnRun)
 
-$btnCancel          = New-Object System.Windows.Forms.Button
-$btnCancel.Text     = 'Close'
-$btnCancel.Location = New-Object System.Drawing.Point(500, 375)
-$btnCancel.Size     = New-Object System.Drawing.Size(90, 36)
-$form.Controls.Add($btnCancel)
-$btnCancel.Add_Click({ $form.Close() })
+$btnClose          = New-Object System.Windows.Forms.Button
+$btnClose.Text     = 'Close'
+$btnClose.Location = New-Object System.Drawing.Point(500, 375)
+$btnClose.Size     = New-Object System.Drawing.Size(90, 36)
+$form.Controls.Add($btnClose)
+$btnClose.Add_Click({ $form.Close() })
 
 # ── Output box ────────────────────────────────────────────────────────────────
 $txtOutput             = New-Object System.Windows.Forms.TextBox
@@ -195,65 +195,21 @@ function Get-CheckedStrings([System.Windows.Forms.CheckedListBox]$clb) {
     return $arr
 }
 
-function Set-UIEnabled {
-    param([bool]$enabled)
-    $controls = @($btnRun, $btnCancel, $txtPw, $txtNewCmd, $btnAddCmd,
-                  $clbHosts, $clbCmds, $btnAllHosts, $btnNoneHosts,
-                  $btnAllCmds, $btnNoneCmds)
-    foreach ($ctrl in $controls) {
-        if ($ctrl.InvokeRequired) {
-            $ctrl.Invoke([Action]{ $ctrl.Enabled = $enabled })
-        } else {
-            $ctrl.Enabled = $enabled
-        }
-    }
-}
-
-# Invoke plink using System.Diagnostics.Process — the PowerShell pipe operator
-# blocks when called from a BackgroundWorker thread, so we manage stdin/stdout directly.
-function Invoke-Plink {
-    param(
-        [string]$PlinkExe,
-        [string[]]$PlinkArgs,
-        [string]$StdinText,
-        [int]$TimeoutMs = 30000
-    )
-
-    $psi                        = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName               = $PlinkExe
-    $psi.Arguments              = $PlinkArgs -join ' '
-    $psi.UseShellExecute        = $false
-    $psi.RedirectStandardInput  = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.CreateNoWindow         = $true
-
-    $proc = [System.Diagnostics.Process]::Start($psi)
-
-    $proc.StandardInput.WriteLine($StdinText)
-    $proc.StandardInput.Close()
-
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-
-    $proc.WaitForExit($TimeoutMs) | Out-Null
-    $exitCode = $proc.ExitCode
-    $proc.Dispose()
-
-    return [PSCustomObject]@{
-        Output   = ($stdout + $stderr).Trim()
-        ExitCode = $exitCode
-    }
+# Append to output box and pump the UI so it updates during synchronous run
+function Write-OutputBox([string]$text) {
+    $txtOutput.AppendText($text)
+    $txtOutput.SelectionStart = $txtOutput.Text.Length
+    $txtOutput.ScrollToCaret()
+    $form.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
 }
 
 #endregion
 
-#region ── RUN LOGIC (BackgroundWorker) ──────────────────────────────────────
-
-$worker                       = New-Object System.ComponentModel.BackgroundWorker
-$worker.WorkerReportsProgress = $true
+#region ── RUN LOGIC ─────────────────────────────────────────────────────────
 
 $btnRun.Add_Click({
+
     $selectedHosts = Get-CheckedStrings -clb $clbHosts
     $selectedCmds  = Get-CheckedStrings -clb $clbCmds
 
@@ -274,59 +230,29 @@ $btnRun.Add_Click({
         return
     }
 
-    Set-UIEnabled $false
+    $btnRun.Enabled  = $false
+    $btnClose.Enabled = $false
 
-    $worker.RunWorkerAsync([PSCustomObject]@{
-        Hosts     = $selectedHosts
-        Commands  = $selectedCmds
-        Password  = $txtPw.Text
-        Output    = $txtOutput
-        LogFolder = $LogFolder
-        PlinkPath = $PlinkPath
-        User      = $User
-    })
-})
+    $password = $txtPw.Text
 
-$worker.Add_DoWork({
-    param($sender, $e)
-    $a        = $e.Argument
-    $hosts    = $a.Hosts
-    $cmds     = $a.Commands
-    $password = $a.Password
-    $out      = $a.Output
-    $logDir   = $a.LogFolder
-    $plink    = $a.PlinkPath
-    $user     = $a.User
+    # 'y' answers the PuTTY 0.72 host key prompt on first connection; ignored thereafter
+    $clishPayload = "y`n" + ($selectedCmds -join "`n")
 
-    # UI append defined inline — functions defined outside DoWork are not
-    # accessible across the BackgroundWorker thread boundary in PowerShell.
-    $uiAppend = [Action[string]]{
-        param($t)
-        $out.AppendText($t)
-        $out.SelectionStart = $out.Text.Length
-        $out.ScrollToCaret()
-    }
-    $log = { param($t); $out.Invoke($uiAppend, $t) }
-
-    & $log "Starting run at $([DateTime]::Now)`r`n"
-    & $log "Hosts   : $($hosts -join ', ')`r`n"
-    & $log "Commands:`r`n"
-    foreach ($c in $cmds) { & $log "  $c`r`n" }
-    & $log "`r`n"
-
-    # First attempt: plain commands via stdin, one per line.
-    # This works when the SSH login shell is clish (standard Gaia).
-    # 'y' at the front answers the host-key prompt on first connection (PuTTY 0.72).
-    $clishPayload = "y`n" + ($cmds -join "`n")
-
-    # Fallback: single clish -c "cmd1" -c "cmd2" ... string via stdin.
-    # Used when the login shell is bash/expert mode — clish must be invoked explicitly.
-    $clishWrapped  = ($cmds | ForEach-Object { "-c `"$($_ -replace '"', '\"')`"" }) -join ' '
+    $clishWrapped  = ($selectedCmds | ForEach-Object {
+        "-c `"$($_ -replace '"','\"')`""
+    }) -join ' '
     $expertPayload = "y`nclish $clishWrapped"
 
-    foreach ($targetHost in $hosts) {
-        & $log "-> $targetHost`r`n"
-        $logfile = Join-Path $logDir "$targetHost.log"
+    Write-OutputBox "Starting run at $([DateTime]::Now)`r`n"
+    Write-OutputBox "Hosts   : $($selectedHosts -join ', ')`r`n"
+    Write-OutputBox "Commands:`r`n"
+    foreach ($c in $selectedCmds) { Write-OutputBox "  $c`r`n" }
+    Write-OutputBox "`r`n"
+
+    foreach ($targetHost in $selectedHosts) {
+
+        Write-OutputBox "-> $targetHost`r`n"
+        $logfile = Join-Path $LogFolder "$targetHost.log"
 
         try {
             $plinkArgs = @('-batch')
@@ -334,48 +260,46 @@ $worker.Add_DoWork({
                 $plinkArgs += '-pw'
                 $plinkArgs += $password
             }
-            $plinkArgs += "$user@$targetHost"
+            $plinkArgs += "$User@$targetHost"
 
             $displayArgs = ($plinkArgs -join ' ') -replace [regex]::Escape($password), '********'
-            & $log "  cmd   : $plink $displayArgs`r`n"
-            & $log "  stdin : $($cmds -join ' | ')`r`n"
+            Write-OutputBox "  cmd   : $PlinkPath $displayArgs`r`n"
+            Write-OutputBox "  stdin : $($selectedCmds -join ' | ')`r`n"
 
-            # First attempt — clish login shell
-            $result  = Invoke-Plink -PlinkExe $plink -PlinkArgs $plinkArgs -StdinText $clishPayload
-            $outText = $result.Output
+            # First attempt — plain commands via stdin (clish login shell)
+            $procOutput = $clishPayload | & $PlinkPath @plinkArgs 2>&1
+            $exitCode   = $LASTEXITCODE
+            $outText    = ($procOutput | ForEach-Object { $_.ToString() }) -join "`r`n"
 
-            # If CLINFR0329 appears the shell is bash — retry with clish -c wrapping
+            # CLINFR0329 means login shell is bash — retry with explicit clish -c
             if ($outText -match 'CLINFR0329') {
-                & $log "  [login shell is bash — retrying with clish -c]`r`n"
-                $result  = Invoke-Plink -PlinkExe $plink -PlinkArgs $plinkArgs -StdinText $expertPayload
-                $outText = $result.Output
+                Write-OutputBox "  [login shell is bash — retrying with clish -c]`r`n"
+                $procOutput = $expertPayload | & $PlinkPath @plinkArgs 2>&1
+                $exitCode   = $LASTEXITCODE
+                $outText    = ($procOutput | ForEach-Object { $_.ToString() }) -join "`r`n"
             }
-
-            $exitCode = $result.ExitCode
 
             if ($outText -ne '') {
                 $outText | Out-File -FilePath $logfile -Encoding UTF8
-                & $log "$outText`r`n"
+                Write-OutputBox "$outText`r`n"
             } else {
-                & $log "  [no output]`r`n"
+                Write-OutputBox "  [no output]`r`n"
                 '' | Out-File -FilePath $logfile -Encoding UTF8
             }
 
             $status = if ($exitCode -eq 0) { 'OK' } else { "EXIT $exitCode" }
-            & $log "  status: $status  |  log: $logfile`r`n`r`n"
+            Write-OutputBox "  status: $status  |  log: $logfile`r`n`r`n"
 
         } catch {
-            & $log "  ERROR: $_`r`n`r`n"
+            Write-OutputBox "  ERROR: $_`r`n`r`n"
         }
-
-        Start-Sleep -Milliseconds 300
     }
 
-    & $log "Finished at $([DateTime]::Now)`r`n"
-})
+    Write-OutputBox "Finished at $([DateTime]::Now)`r`n"
 
-$worker.Add_RunWorkerCompleted({
-    Set-UIEnabled $true
+    $btnRun.Enabled  = $true
+    $btnClose.Enabled = $true
+
     [System.Windows.Forms.MessageBox]::Show(
         "Run complete.`nLogs in: $LogFolder",
         'Done',
